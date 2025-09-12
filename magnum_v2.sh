@@ -8,13 +8,13 @@ set -euo pipefail
 trap 'echo "ERROR on line $LINENO"; exit 1' ERR
 
 # ---------------- CONFIG (EDIT BEFORE RUNNING) ----------------
-DISK="/dev/nvme0n1"        # <<< CHANGE THIS to your target disk (e.g. /dev/sda or /dev/nvme0n1)
-EFI_SIZE="512MiB"
+DISK="/dev/sda"        # <<< CHANGE THIS to your target disk (e.g. /dev/sda or /dev/nvme0n1)
+EFI_SIZE="1024MiB"
 CRYPT_NAME="cryptroot"
 BTRFS_LABEL="ARCHCRYPT"
 HOSTNAME="arch-secure"
-USERNAME="massi"
-TIMEZONE="Europe/Algiers"
+USERNAME="massylii"
+TIMEZONE="Africa/Algiers"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
 # packages to install in base system
@@ -91,7 +91,7 @@ mkfs.fat -F32 -n EFI "$EFI_PART"
 
 # Setup LUKS2 (interactive passphrase)
 echo "Initializing LUKS2 on $LUKS_PART (you will be prompted for a passphrase)..."
-cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 2000 "$LUKS_PART"
+cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --hash sha512 --iter-time 5000 --key-size 512 --pbkdf argon2id --use-urandom --verify-passphrase "$LUKS_PART"
 cryptsetup open "$LUKS_PART" "$CRYPT_NAME"
 
 CRYPT_DEV="/dev/mapper/${CRYPT_NAME}"
