@@ -85,13 +85,13 @@ echo "LUKS: $LUKS_PART"
 sleep 1
 partprobe "$DISK" || true
 
-# Format EFI
-echo "Formatting EFI partition..."
+# Format EFI (ensure it's a FAT32 ESP)
+echo "Formatting EFI partition ($EFI_PART) as FAT32..."
 mkfs.fat -F32 -n EFI "$EFI_PART"
 
 # Setup LUKS2 (interactive passphrase)
 echo "Initializing LUKS2 on $LUKS_PART (you will be prompted for a passphrase)..."
-cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --hash sha512 --iter-time 5000 --key-size 512 --pbkdf argon2id --use-urandom --verify-passphrase "$LUKS_PART"
+cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --hash sha512 --iter-time 5000 --key-size 512 --pbkdf argon2id "$LUKS_PART"
 cryptsetup open "$LUKS_PART" "$CRYPT_NAME"
 
 CRYPT_DEV="/dev/mapper/${CRYPT_NAME}"
@@ -113,24 +113,26 @@ umount /mnt
 MOUNT_OPTS="noatime,ssd,space_cache=v2,compress=zstd:1,autodefrag,discard=async,subvol="
 echo "Mounting root (@) to /mnt"
 mount -o ${MOUNT_OPTS}@ "$CRYPT_DEV" /mnt
-mkdir -p /mnt/{home,var,.snapshots,tmp,boot/efi}
+mkdir -p /mnt/{home,var,.snapshots,tmp,boot}
 
+# mount other subvolumes
 mount -o ${MOUNT_OPTS}@home "$CRYPT_DEV" /mnt/home
 mount -o ${MOUNT_OPTS}@var "$CRYPT_DEV" /mnt/var
 mount -o ${MOUNT_OPTS}@snapshots "$CRYPT_DEV" /mnt/.snapshots
 # /tmp with hardened mount options
 mount -o noatime,ssd,space_cache=v2,compress=zstd:1,autodefrag,discard=async,noexec,nosuid,nodev,subvol=@tmp "$CRYPT_DEV" /mnt/tmp
 
-# Mount EFI
-mount "$EFI_PART" /mnt/boot/efi
+# Mount EFI onto /mnt/boot (IMPORTANT: systemd-boot expects a FAT mounted at /boot)
+echo "Mounting EFI partition ($EFI_PART) to /mnt/boot (FAT32 ESP)..."
+mount "$EFI_PART" /mnt/boot
 
 # Install base system
 echo "Installing base packages: $PKGS"
 pacstrap /mnt $PKGS
 
-# Generate fstab
+# Generate fstab (use -U so it uses UUIDs)
 echo "Generating fstab"
-genfstab -U /mnt >> /mnt/etc/fstab
+genfstab -U /mnt > /mnt/etc/fstab
 
 # Write a comprehensive chroot script to finalize config
 cat > /mnt/root/finish_install.sh <<'EOF'
@@ -178,11 +180,13 @@ else
 fi
 mkinitcpio -P
 
-# Install systemd-boot
+# Install systemd-boot (expects /boot to be mounted to the FAT ESP)
+echo "Installing systemd-boot to /boot (ESP)..."
 bootctl --path=/boot install
 
 # Build loader entry that uses cryptdevice and points root to /dev/mapper/<crypt>
 LUKS_UUID=$(blkid -s UUID -o value "${LUKS_PART_PLACE}")
+mkdir -p /boot/loader/entries
 cat > /boot/loader/loader.conf <<LOADER
 default arch
 timeout 4
@@ -217,24 +221,32 @@ HOOK
 
 # sbctl: generate keys and enroll
 # Non-destructive (if keys exist, sbctl will not overwrite without prompt)
+echo "Creating sbctl keys..."
 sbctl create-keys
-echo "Attempting to enroll sbctl keys into firmware (may require UEFI prompt/confirmation)..."
-sbctl enroll-keys
+
+echo "Enrolling sbctl keys into firmware (you may see a UEFI prompt — accept to enroll) ..."
+sbctl enroll-keys || echo "sbctl enroll-keys returned non-zero; check firmware / UEFI prompts"
 
 # Sign kernels and initrds now
-sbctl sign -a || true
+echo "Signing kernel/initramfs with sbctl..."
+sbctl sign -a || echo "sbctl sign -a failed or produced warnings (check /etc/secure-boot/keys)"
 
 # Attempt to sign systemd-boot EFI binary so firmware accepts it
-BOOT_EFI_PATH="/boot/EFI/systemd/systemd-bootx64.efi"
-if [ -f "${BOOT_EFI_PATH}" ]; then
-  if [ -f /etc/secure-boot/keys/db.key ]; then
-    /usr/bin/sbsign --key /etc/secure-boot/keys/db.key --cert /etc/secure-boot/keys/db.crt --output "${BOOT_EFI_PATH}.signed" "${BOOT_EFI_PATH}" \
-      && mv "${BOOT_EFI_PATH}.signed" "${BOOT_EFI_PATH}" \
-      || echo "sbsign failed to sign systemd-boot. Check /etc/secure-boot/keys"
-  else
-    echo "sbctl-generated keys not found at /etc/secure-boot/keys; systemd-boot may need manual signing."
+# bootctl places files under /boot/EFI/systemd/ or /boot/EFI/BOOT
+CANDIDATES=( "/boot/EFI/systemd/systemd-bootx64.efi" "/boot/EFI/BOOT/BOOTX64.EFI" "/boot/systemd-bootx64.efi" )
+for p in "${CANDIDATES[@]}"; do
+  if [ -f "$p" ]; then
+    echo "Found boot binary to sign at $p"
+    if [ -f /etc/secure-boot/keys/db.key ]; then
+      /usr/bin/sbsign --key /etc/secure-boot/keys/db.key --cert /etc/secure-boot/keys/db.crt --output "${p}.signed" "${p}" \
+        && mv "${p}.signed" "${p}" \
+        && echo "Signed $p successfully" \
+        || echo "sbsign failed for $p"
+    else
+      echo "sbctl keys not found at /etc/secure-boot/keys; cannot sbsign $p automatically"
+    fi
   fi
-fi
+done
 
 # Basic sysctl hardening (tune as desired)
 mkdir -p /etc/sysctl.d
@@ -288,8 +300,8 @@ cryptsetup close "$CRYPT_NAME" || true
 echo "Installation complete."
 echo "IMPORTANT next steps:"
 echo " - Reboot into firmware and enable Secure Boot if needed."
-echo " - If UEFI prompts for key enrollment, follow the prompts."
-echo " - If system won't boot due to unsigned systemd-boot, you may need to manually sign the binary with sbsign and enroll keys."
+echo " - If UEFI prompts for key enrollment, follow the prompts and accept to enroll keys."
+echo " - If system won't boot because systemd-boot wasn't signed, sign the EFI binary manually with sbsign using the keys in /etc/secure-boot/keys and enroll them in firmware."
 echo " - Kernel updates will be automatically signed by the pacman hook created (/etc/pacman.d/hooks/sbctl-sign.hook)."
 echo
 echo "Reboot now? (y/N)"
