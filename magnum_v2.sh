@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# magnum_full_secure_install.sh
-# Full single-script Arch installer:
-# LUKS2 -> Btrfs (subvols: @, @home, @var, @snapshots, @tmp)
-# systemd-boot + sbctl for Secure Boot, plus kernel-signing pacman hook
-#
+# magnum_full_secure_install_fixed.sh
+# Full single-script Arch installer (fixed):
+# - GPT UEFI
+# - LUKS2 -> Btrfs with subvolumes: @, @home, @var, @snapshots, @tmp
+# - /tmp mounted noexec,nosuid,nodev
+# - systemd-boot installed to FAT ESP (/boot)
+# - Writes cryptdevice=UUID=...:cryptroot into loader entry and /etc/crypttab
+# - Rebuilds initramfs, creates UKI via kernel-install, signs with sbctl
+# - Pacman hooks sign linux and linux-lts on update
 set -euo pipefail
 trap 'echo "ERROR on line $LINENO"; exit 1' ERR
 
@@ -22,7 +26,6 @@ PKGS="base linux linux-headers linux-firmware btrfs-progs sbctl sbsigntools dosf
 efibootmgr networkmanager vim sudo openssh"
 # ----------------------------------------------------------------
 
-# helper for nvme partition names
 part() {
   local disk="$1" num="$2"
   if [[ "$disk" =~ nvme ]]; then
@@ -44,9 +47,9 @@ if [ "$conf" != "I UNDERSTAND" ]; then
   exit 1
 fi
 
-# Prompt for passwords (will be used for root + user)
 read -rp "Username to create (default: $USERNAME): " tmpu
 [ -n "$tmpu" ] && USERNAME="$tmpu"
+
 echo "Enter password for root (you'll confirm):"
 passwd_root() {
   read -s -p "Root password: " r1; echo
@@ -81,22 +84,20 @@ LUKS_PART="$(part "$DISK" 2)"
 echo "EFI: $EFI_PART"
 echo "LUKS: $LUKS_PART"
 
-# Wait for device nodes
 sleep 1
 partprobe "$DISK" || true
 
-# Format EFI (ensure it's a FAT32 ESP)
+# Format EFI
 echo "Formatting EFI partition ($EFI_PART) as FAT32..."
 mkfs.fat -F32 -n EFI "$EFI_PART"
 
-# Setup LUKS2 (interactive passphrase)
+# LUKS setup (interactive)
 echo "Initializing LUKS2 on $LUKS_PART (you will be prompted for a passphrase)..."
 cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --hash sha512 --iter-time 5000 --key-size 512 --pbkdf argon2id "$LUKS_PART"
 cryptsetup open "$LUKS_PART" "$CRYPT_NAME"
-
 CRYPT_DEV="/dev/mapper/${CRYPT_NAME}"
 
-# Create Btrfs and subvolumes
+# Btrfs + subvolumes
 echo "Creating Btrfs on $CRYPT_DEV..."
 mkfs.btrfs -L "$BTRFS_LABEL" "$CRYPT_DEV"
 
@@ -109,36 +110,33 @@ btrfs subvolume create /mnt/@snapshots
 btrfs subvolume create /mnt/@tmp
 umount /mnt
 
-# Mount subvolumes with recommended options
 MOUNT_OPTS="noatime,ssd,space_cache=v2,compress=zstd:1,autodefrag,discard=async,subvol="
 echo "Mounting root (@) to /mnt"
 mount -o ${MOUNT_OPTS}@ "$CRYPT_DEV" /mnt
 mkdir -p /mnt/{home,var,.snapshots,tmp,boot}
 
-# mount other subvolumes
 mount -o ${MOUNT_OPTS}@home "$CRYPT_DEV" /mnt/home
 mount -o ${MOUNT_OPTS}@var "$CRYPT_DEV" /mnt/var
 mount -o ${MOUNT_OPTS}@snapshots "$CRYPT_DEV" /mnt/.snapshots
-# /tmp with hardened mount options
 mount -o noatime,ssd,space_cache=v2,compress=zstd:1,autodefrag,discard=async,noexec,nosuid,nodev,subvol=@tmp "$CRYPT_DEV" /mnt/tmp
 
-# Mount EFI onto /mnt/boot (IMPORTANT: systemd-boot expects a FAT mounted at /boot)
-echo "Mounting EFI partition ($EFI_PART) to /mnt/boot (FAT32 ESP)..."
+# Mount EFI at /mnt/boot (systemd-boot expects FAT at /boot)
+echo "Mounting EFI partition ($EFI_PART) to /mnt/boot..."
 mount "$EFI_PART" /mnt/boot
 
 # Install base system
 echo "Installing base packages: $PKGS"
 pacstrap /mnt $PKGS
 
-# Generate fstab (use -U so it uses UUIDs)
+# Generate fstab
 echo "Generating fstab"
 genfstab -U /mnt > /mnt/etc/fstab
 
-# Write a comprehensive chroot script to finalize config
+# Create chroot finish script
 cat > /mnt/root/finish_install.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# Variables passed from outer script will be replaced before chroot
+
 HOSTNAME_PLACE="%HOSTNAME%"
 USERNAME_PLACE="%USERNAME%"
 TIMEZONE_PLACE="%TIMEZONE%"
@@ -154,7 +152,6 @@ echo "${LOCALE_PLACE} UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=${LOCALE_PLACE}" > /etc/locale.conf
 
-# Keymap
 echo "KEYMAP=${KEYMAP_PLACE}" > /etc/vconsole.conf
 
 # Hostname and hosts
@@ -165,27 +162,29 @@ cat > /etc/hosts <<HOSTS
 127.0.1.1	${HOSTNAME_PLACE}.localdomain ${HOSTNAME_PLACE}
 HOSTS
 
-# Create user and set passwords (we'll set actual passwords from outside using chpasswd)
+# Create user
 useradd -m -G wheel -s /bin/bash "${USERNAME_PLACE}"
-# Ensure wheel can sudo
 echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/50-wheel
 chmod 0440 /etc/sudoers.d/50-wheel
 
-# mkinitcpio: use systemd + sd-encrypt + btrfs
-# Ensure sd-encrypt present and before filesystems
+# Ensure mkinitcpio uses systemd + sd-encrypt + btrfs
 if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
   sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
 else
   echo 'HOOKS=(base systemd autodetect keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)' >> /etc/mkinitcpio.conf
 fi
+
+# Find LUKS UUID and write into /etc/crypttab and loader entry
+LUKS_UUID=$(blkid -s UUID -o value "${LUKS_PART_PLACE}")
+echo "${CRYPT_NAME_PLACE} UUID=${LUKS_UUID} none luks,discard" > /etc/crypttab
+
+# Rebuild initramfs so sd-encrypt is included
 mkinitcpio -P
 
-# Install systemd-boot (expects /boot to be mounted to the FAT ESP)
-echo "Installing systemd-boot to /boot (ESP)..."
+# Install systemd-boot to the mounted FAT ESP
 bootctl --path=/boot install
 
-# Build loader entry that uses cryptdevice and points root to /dev/mapper/<crypt>
-LUKS_UUID=$(blkid -s UUID -o value "${LUKS_PART_PLACE}")
+# Write loader files with correct cryptdevice UUID
 mkdir -p /boot/loader/entries
 cat > /boot/loader/loader.conf <<LOADER
 default arch
@@ -200,13 +199,13 @@ initrd  /initramfs-linux.img
 options cryptdevice=UUID=${LUKS_UUID}:${CRYPT_NAME_PLACE} root=/dev/mapper/${CRYPT_NAME_PLACE} rw rootflags=subvol=@
 ENTRY
 
-# Enable recommended services
+# Enable basic services
 systemctl enable NetworkManager
 systemctl enable fstrim.timer
 
-# Create pacman hook so sbctl signs kernels when linux is installed/updated
+# Pacman hooks: sign linux & linux-lts after install/upgrade
 mkdir -p /etc/pacman.d/hooks
-cat > /etc/pacman.d/hooks/sbctl-sign.hook <<HOOK
+cat > /etc/pacman.d/hooks/sbctl-sign-linux.hook <<HOOK
 [Trigger]
 Operation = Install
 Operation = Upgrade
@@ -219,59 +218,79 @@ When = PostTransaction
 Exec = /usr/bin/sbctl sign -a
 HOOK
 
-# sbctl: generate keys and enroll
-# Non-destructive (if keys exist, sbctl will not overwrite without prompt)
+cat > /etc/pacman.d/hooks/sbctl-sign-linux-lts.hook <<HOOK
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux-lts
+
+[Action]
+Description = Signing linux-lts kernel and initramfs with sbctl...
+When = PostTransaction
+Exec = /usr/bin/sbctl sign -a
+HOOK
+
+# Create sbctl keys and enroll them (may prompt UEFI)
 echo "Creating sbctl keys..."
 sbctl create-keys
 
-echo "Enrolling sbctl keys into firmware (you may see a UEFI prompt — accept to enroll) ..."
-sbctl enroll-keys || echo "sbctl enroll-keys returned non-zero; check firmware / UEFI prompts"
+echo "Enrolling sbctl keys into firmware (may require UEFI prompt/accept)..."
+sbctl enroll-keys || echo "sbctl enroll-keys returned non-zero; check firmware prompts"
 
-# Sign kernels and initrds now
-echo "Signing kernel/initramfs with sbctl..."
-sbctl sign -a || echo "sbctl sign -a failed or produced warnings (check /etc/secure-boot/keys)"
+# Create a UKI (unified kernel image) using kernel-install, then sign
+# kernel-install needs a version string; use a module dir to find the installed version
+if ls /lib/modules >/dev/null 2>&1; then
+  KVER=$(ls /lib/modules | head -n1)
+  echo "Kernel version detected: ${KVER}"
+  # Ensure /boot/vmlinuz-linux exists (pacstrap should have installed it)
+  if [ -f /boot/vmlinuz-linux ]; then
+    echo "Creating UKI via kernel-install..."
+    kernel-install add "${KVER}" /boot/vmlinuz-linux
+  else
+    echo "/boot/vmlinuz-linux not found; skipping kernel-install UKI creation"
+  fi
+fi
 
-# Attempt to sign systemd-boot EFI binary so firmware accepts it
-# bootctl places files under /boot/EFI/systemd/ or /boot/EFI/BOOT
+# Sign everything sbctl knows about
+echo "Signing kernels and initramfs with sbctl..."
+sbctl sign -a || echo "sbctl sign -a had warnings/errors — check /etc/secure-boot/keys"
+
+# Try to sbsign systemd-boot EFI binary (look in a few common locations)
 CANDIDATES=( "/boot/EFI/systemd/systemd-bootx64.efi" "/boot/EFI/BOOT/BOOTX64.EFI" "/boot/systemd-bootx64.efi" )
 for p in "${CANDIDATES[@]}"; do
   if [ -f "$p" ]; then
-    echo "Found boot binary to sign at $p"
+    echo "Found boot binary: $p"
     if [ -f /etc/secure-boot/keys/db.key ]; then
-      /usr/bin/sbsign --key /etc/secure-boot/keys/db.key --cert /etc/secure-boot/keys/db.crt --output "${p}.signed" "${p}" \
+      sbsign --key /etc/secure-boot/keys/db.key --cert /etc/secure-boot/keys/db.crt --output "${p}.signed" "${p}" \
         && mv "${p}.signed" "${p}" \
-        && echo "Signed $p successfully" \
-        || echo "sbsign failed for $p"
+        && echo "Signed $p"
     else
       echo "sbctl keys not found at /etc/secure-boot/keys; cannot sbsign $p automatically"
     fi
   fi
 done
 
-# Basic sysctl hardening (tune as desired)
+# Basic sysctl hardening
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-hardening.conf <<SYSCTL
-# Networking
 net.ipv4.ip_forward = 0
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
-# Disable source routing
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
-# ICMP
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-# IPv6
 net.ipv6.conf.all.forwarding = 0
 SYSCTL
 
-# Rebuild initramfs to ensure changes applied
+# Rebuild initramfs (again, to be safe)
 mkinitcpio -P
 
-echo "CHROOT CONFIGURATION COMPLETE"
+echo "CHROOT: finished"
 EOF
 
-# Replace placeholders before chroot
+# Replace placeholders
 sed \
   -e "s|%HOSTNAME%|$HOSTNAME|g" \
   -e "s|%USERNAME%|$USERNAME|g" \
@@ -283,29 +302,23 @@ sed \
   /mnt/root/finish_install.sh > /mnt/root/finish_install.sh.tmp && mv /mnt/root/finish_install.sh.tmp /mnt/root/finish_install.sh
 chmod +x /mnt/root/finish_install.sh
 
-# Chroot and run final steps
-echo "Entering chroot to finalize installation..."
+# Run the chroot script
+echo "Entering chroot to run finish steps..."
 arch-chroot /mnt /root/finish_install.sh
 
-# Set root and user passwords from outside (less risk of heredoc inside chroot)
+# Set passwords
 echo "Setting root and user passwords..."
 arch-chroot /mnt /bin/bash -c "echo root:${ROOT_PW} | chpasswd"
 arch-chroot /mnt /bin/bash -c "echo ${USERNAME}:${USER_PW} | chpasswd"
 
 # Final cleanup
-echo "Cleaning up and unmounting..."
+echo "Unmounting..."
 umount -R /mnt || true
 cryptsetup close "$CRYPT_NAME" || true
 
-echo "Installation complete."
-echo "IMPORTANT next steps:"
-echo " - Reboot into firmware and enable Secure Boot if needed."
-echo " - If UEFI prompts for key enrollment, follow the prompts and accept to enroll keys."
-echo " - If system won't boot because systemd-boot wasn't signed, sign the EFI binary manually with sbsign using the keys in /etc/secure-boot/keys and enroll them in firmware."
-echo " - Kernel updates will be automatically signed by the pacman hook created (/etc/pacman.d/hooks/sbctl-sign.hook)."
-echo
-echo "Reboot now? (y/N)"
-read -r REBOOT_NOW
+echo "Done. Reboot when ready."
+echo "If your firmware prompts to confirm key enrollment, accept it."
+read -r -p "Reboot now? (y/N) " REBOOT_NOW
 if [[ "${REBOOT_NOW,,}" == "y" ]]; then
   reboot
 fi
