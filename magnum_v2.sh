@@ -1,509 +1,299 @@
 #!/usr/bin/env bash
-
-# Automated Secure Arch Linux Installation Script
-# Based on Ataraxxia's secure-arch guide with modifications:
-# - Removed LVM
-# - Added btrfs filesystem with subvolumes
-# - Enhanced LUKS2 encryption settings
-# - Automated installation process
-
+# magnum_full_secure_install.sh
+# Full single-script Arch installer:
+# LUKS2 -> Btrfs (subvols: @, @home, @var, @snapshots, @tmp)
+# systemd-boot + sbctl for Secure Boot, plus kernel-signing pacman hook
+#
 set -euo pipefail
+trap 'echo "ERROR on line $LINENO"; exit 1' ERR
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# ---------------- CONFIG (EDIT BEFORE RUNNING) ----------------
+DISK="/dev/nvme0n1"        # <<< CHANGE THIS to your target disk (e.g. /dev/sda or /dev/nvme0n1)
+EFI_SIZE="512MiB"
+CRYPT_NAME="cryptroot"
+BTRFS_LABEL="ARCHCRYPT"
+HOSTNAME="arch-secure"
+USERNAME="massi"
+TIMEZONE="Europe/Algiers"
+LOCALE="en_US.UTF-8"
+KEYMAP="us"
+# packages to install in base system
+PKGS="base linux linux-headers linux-firmware btrfs-progs sbctl sbsigntools dosfstools \
+efibootmgr networkmanager vim sudo openssh"
+# ----------------------------------------------------------------
 
-# Configuration variables - MODIFY THESE (or they'll be prompted)
-DISK=""              # Will be prompted if empty
-EFI_SIZE="1024M"
-USERNAME=""          # Will be prompted if empty
-HOSTNAME="archbtw"   # Your chosen hostname
-TIMEZONE="Africa/Algiers"  # Your timezone
-LOCALE="en_US.UTF-8"       # Your locale
-KEYMAP="us"               # Your keymap
-CPU_VENDOR="intel"        # Change to "amd" if you have AMD CPU
-
-# Partition variables (set dynamically after disk selection)
-EFI_PART=""
-ROOT_PART=""
-
-# Helper functions
-log() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+# helper for nvme partition names
+part() {
+  local disk="$1" num="$2"
+  if [[ "$disk" =~ nvme ]]; then
+    echo "${disk}p${num}"
+  else
+    echo "${disk}${num}"
+  fi
 }
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Run this as root from an Arch live ISO."
+  exit 1
+fi
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
-}
+echo "Target disk: $DISK"
+read -rp "THIS WILL DESTROY ALL DATA ON $DISK. Type EXACTLY 'I UNDERSTAND' to continue: " conf
+if [ "$conf" != "I UNDERSTAND" ]; then
+  echo "Aborted."
+  exit 1
+fi
 
-prompt_continue() {
-    echo -e "${BLUE}[PROMPT]${NC} $1"
-    read -p "Continue? [y/N]: " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Installation aborted."
-        exit 1
-    fi
+# Prompt for passwords (will be used for root + user)
+read -rp "Username to create (default: $USERNAME): " tmpu
+[ -n "$tmpu" ] && USERNAME="$tmpu"
+echo "Enter password for root (you'll confirm):"
+passwd_root() {
+  read -s -p "Root password: " r1; echo
+  read -s -p "Confirm root password: " r2; echo
+  [ "$r1" = "$r2" ] || { echo "Mismatch, try again"; passwd_root; return; }
+  ROOT_PW="$r1"
 }
+passwd_root
 
-prompt_disk_selection() {
-    log "Available disks:"
-    lsblk -d -o NAME,SIZE,MODEL | grep -E '^(sd|nvme|vd|hd)'
-    echo
-    
-    while true; do
-        read -p "Enter the disk to install on (e.g., /dev/sda, /dev/nvme0n1): " DISK
-        
-        if [[ ! -b "$DISK" ]]; then
-            error "Device $DISK does not exist!"
-            continue
-        fi
-        
-        echo
-        warn "WARNING: This will COMPLETELY ERASE $DISK!"
-        lsblk "$DISK"
-        echo
-        
-        read -p "Are you sure you want to use $DISK? [y/N]: " -n 1 -r
-        echo
-        
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            break
-        fi
-    done
-    
-    # Set partition variables based on disk type
-    if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmc"* ]]; then
-        EFI_PART="${DISK}p1"
-        ROOT_PART="${DISK}p2"
-    else
-        EFI_PART="${DISK}1"
-        ROOT_PART="${DISK}2"
-    fi
-    
-    log "Selected disk: $DISK"
-    log "EFI partition will be: $EFI_PART"
-    log "Root partition will be: $ROOT_PART"
+echo "Enter password for user '$USERNAME' (you'll confirm):"
+passwd_user() {
+  read -s -p "User password: " u1; echo
+  read -s -p "Confirm user password: " u2; echo
+  [ "$u1" = "$u2" ] || { echo "Mismatch, try again"; passwd_user; return; }
+  USER_PW="$u1"
 }
+passwd_user
 
-prompt_basic_config() {
-    if [[ -z "$USERNAME" ]]; then
-        read -p "Enter username: " USERNAME
-    fi
-    
-    log "Username: $USERNAME"
-    log "Hostname: $HOSTNAME"
-}
+# Partitioning
+echo "Wiping partition table..."
+sgdisk --zap-all "$DISK"
 
-check_uefi() {
-    if [[ ! -d /sys/firmware/efi/efivars ]]; then
-        error "This system is not booted in UEFI mode!"
-    fi
-    log "UEFI mode confirmed"
-}
+echo "Creating partitions..."
+parted --script "$DISK" \
+  mklabel gpt \
+  mkpart ESP fat32 1MiB ${EFI_SIZE} \
+  set 1 boot on \
+  mkpart primary ${EFI_SIZE} 100%
 
-check_internet() {
-    if ! ping -c 1 archlinux.org &> /dev/null; then
-        error "No internet connection! Please configure your network first."
-    fi
-    log "Internet connection confirmed"
-}
+EFI_PART="$(part "$DISK" 1)"
+LUKS_PART="$(part "$DISK" 2)"
+echo "EFI: $EFI_PART"
+echo "LUKS: $LUKS_PART"
 
-setup_pacman_keys() {
-    log "Setting up pacman keys..."
-    pacman-key --init
-    pacman-key --populate archlinux
-}
+# Wait for device nodes
+sleep 1
+partprobe "$DISK" || true
 
-partition_disk() {
-    log "Partitioning disk: $DISK"
-    
-    # Create GPT partition table and partitions
-    sgdisk --zap-all "$DISK"
-    sgdisk --clear \
-           --new=1:0:+${EFI_SIZE} --typecode=1:ef00 --change-name=1:'EFI System Partition' \
-           --new=2:0:0 --typecode=2:8309 --change-name=2:'Linux LUKS' \
-           "$DISK"
-    
-    # Inform kernel of partition changes
-    partprobe "$DISK"
-    sleep 2
-    
-    log "Partition table created"
-    sgdisk --print "$DISK"
-}
+# Format EFI
+echo "Formatting EFI partition..."
+mkfs.fat -F32 -n EFI "$EFI_PART"
 
-format_efi() {
-    log "Formatting EFI partition..."
-    mkfs.fat -F32 -n "EFI" "$EFI_PART"
-}
+# Setup LUKS2 (interactive passphrase)
+echo "Initializing LUKS2 on $LUKS_PART (you will be prompted for a passphrase)..."
+cryptsetup luksFormat --type luks2 --pbkdf argon2id --iter-time 2000 "$LUKS_PART"
+cryptsetup open "$LUKS_PART" "$CRYPT_NAME"
 
-setup_encryption() {
-    log "Setting up LUKS2 encryption with enhanced security..."
-    echo "Enter passphrase for disk encryption:"
-    
-    cryptsetup luksFormat \
-        --type luks2 \
-        --cipher aes-xts-plain64 \
-        --hash sha512 \
-        --iter-time 5000 \
-        --key-size 512 \
-        --pbkdf argon2id \
-        --use-urandom \
-        --verify-passphrase \
-        "$ROOT_PART"
-    
-    log "Opening encrypted volume..."
-    echo "Enter passphrase to open the encrypted volume:"
-    cryptsetup open --allow-discards --persistent "$ROOT_PART" cryptroot
-}
+CRYPT_DEV="/dev/mapper/${CRYPT_NAME}"
 
-format_btrfs() {
-    log "Creating btrfs filesystem..."
-    mkfs.btrfs -f -L "ArchRoot" /dev/mapper/cryptroot
-    
-    # Mount and create subvolumes
-    mount /dev/mapper/cryptroot /mnt
-    
-    log "Creating btrfs subvolumes..."
-    btrfs subvolume create /mnt/@
-    btrfs subvolume create /mnt/@home
-    btrfs subvolume create /mnt/@var
-    btrfs subvolume create /mnt/@tmp
-    btrfs subvolume create /mnt/@snapshots
-    
-    # Unmount to remount with proper subvolumes
-    umount /mnt
-    
-    # Mount subvolumes with proper options
-    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@ /dev/mapper/cryptroot /mnt
-    
-    mkdir -p /mnt/{home,var,tmp,.snapshots,boot}
-    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@home /dev/mapper/cryptroot /mnt/home
-    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@var /dev/mapper/cryptroot /mnt/var
-    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@tmp /dev/mapper/cryptroot /mnt/tmp
-    mount -o noatime,compress=zstd:3,space_cache=v2,subvol=@snapshots /dev/mapper/cryptroot /mnt/.snapshots
-    
-    mkdir -p /mnt/boot/efi
-    mount "$EFI_PART" /mnt/boot/efi
-    
-    log "Btrfs filesystem and subvolumes created"
-}
+# Create Btrfs and subvolumes
+echo "Creating Btrfs on $CRYPT_DEV..."
+mkfs.btrfs -L "$BTRFS_LABEL" "$CRYPT_DEV"
 
-install_base_system() {
-    log "Installing base system..."
-    
-    # Determine microcode package
-    local ucode_pkg=""
-    if [[ "$CPU_VENDOR" == "intel" ]]; then
-        ucode_pkg="intel-ucode"
-    elif [[ "$CPU_VENDOR" == "amd" ]]; then
-        ucode_pkg="amd-ucode"
-    else
-        error "Invalid CPU vendor. Use 'intel' or 'amd'"
-    fi
-    
-    pacstrap /mnt \
-        base \
-        linux \
-        linux-firmware \
-        "$ucode_pkg" \
-        sudo \
-        vim \
-        dracut \
-        sbsigntools \
-        iwd \
-        git \
-        efibootmgr \
-        binutils \
-        networkmanager \
-        btrfs-progs \
-        man-db
-    
-    log "Base system installed"
-}
+echo "Creating subvolumes..."
+mount "$CRYPT_DEV" /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@var
+btrfs subvolume create /mnt/@snapshots
+btrfs subvolume create /mnt/@tmp
+umount /mnt
 
-generate_fstab() {
-    log "Generating fstab..."
-    genfstab -U /mnt >> /mnt/etc/fstab
-    
-    # Show generated fstab
-    echo "Generated fstab:"
-    cat /mnt/etc/fstab
-}
+# Mount subvolumes with recommended options
+MOUNT_OPTS="noatime,ssd,space_cache=v2,compress=zstd:1,autodefrag,discard=async,subvol="
+echo "Mounting root (@) to /mnt"
+mount -o ${MOUNT_OPTS}@ "$CRYPT_DEV" /mnt
+mkdir -p /mnt/{home,var,.snapshots,tmp,boot/efi}
 
-configure_system() {
-    log "Configuring system in chroot..."
-    
-    # Prompt for passwords
-    echo "Enter root password:"
-    read -s ROOT_PASSWORD
-    echo "Enter user password for $USERNAME:"
-    read -s USER_PASSWORD
-    
-    # Create configuration script to run in chroot
-    cat > /mnt/configure.sh << EOF
-#!/bin/bash
+mount -o ${MOUNT_OPTS}@home "$CRYPT_DEV" /mnt/home
+mount -o ${MOUNT_OPTS}@var "$CRYPT_DEV" /mnt/var
+mount -o ${MOUNT_OPTS}@snapshots "$CRYPT_DEV" /mnt/.snapshots
+# /tmp with hardened mount options
+mount -o noatime,ssd,space_cache=v2,compress=zstd:1,autodefrag,discard=async,noexec,nosuid,nodev,subvol=@tmp "$CRYPT_DEV" /mnt/tmp
+
+# Mount EFI
+mount "$EFI_PART" /mnt/boot/efi
+
+# Install base system
+echo "Installing base packages: $PKGS"
+pacstrap /mnt $PKGS
+
+# Generate fstab
+echo "Generating fstab"
+genfstab -U /mnt >> /mnt/etc/fstab
+
+# Write a comprehensive chroot script to finalize config
+cat > /mnt/root/finish_install.sh <<'EOF'
+#!/usr/bin/env bash
 set -euo pipefail
+# Variables passed from outer script will be replaced before chroot
+HOSTNAME_PLACE="%HOSTNAME%"
+USERNAME_PLACE="%USERNAME%"
+TIMEZONE_PLACE="%TIMEZONE%"
+LOCALE_PLACE="%LOCALE%"
+KEYMAP_PLACE="%KEYMAP%"
+CRYPT_NAME_PLACE="%CRYPT_NAME%"
+LUKS_PART_PLACE="%LUKS_PART%"
 
-# Set root password
-echo "root:$ROOT_PASSWORD" | chpasswd
-
-# Set timezone
-ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+# Timezone & locale
+ln -sf /usr/share/zoneinfo/${TIMEZONE_PLACE} /etc/localtime
 hwclock --systohc
-
-# Set locale
-sed -i 's/#$LOCALE/$LOCALE/' /etc/locale.gen
+echo "${LOCALE_PLACE} UTF-8" > /etc/locale.gen
 locale-gen
-echo "LANG=$LOCALE" > /etc/locale.conf
+echo "LANG=${LOCALE_PLACE}" > /etc/locale.conf
 
-# Set keymap
-echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
-echo "FONT=Lat2-Terminus16" >> /etc/vconsole.conf
+# Keymap
+echo "KEYMAP=${KEYMAP_PLACE}" > /etc/vconsole.conf
 
-# Set hostname
-echo "$HOSTNAME" > /etc/hostname
+# Hostname and hosts
+echo "${HOSTNAME_PLACE}" > /etc/hostname
+cat > /etc/hosts <<HOSTS
+127.0.0.1	localhost
+::1		localhost
+127.0.1.1	${HOSTNAME_PLACE}.localdomain ${HOSTNAME_PLACE}
+HOSTS
 
-# Create user
-useradd -m -G wheel "$USERNAME"
-echo "$USERNAME:$USER_PASSWORD" | chpasswd
+# Create user and set passwords (we'll set actual passwords from outside using chpasswd)
+useradd -m -G wheel -s /bin/bash "${USERNAME_PLACE}"
+# Ensure wheel can sudo
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/50-wheel
+chmod 0440 /etc/sudoers.d/50-wheel
 
-# Configure sudo
-sed -i 's/# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+# mkinitcpio: use systemd + sd-encrypt + btrfs
+# Ensure sd-encrypt present and before filesystems
+if grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
+  sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf
+else
+  echo 'HOOKS=(base systemd autodetect keyboard sd-vconsole block sd-encrypt btrfs filesystems fsck)' >> /etc/mkinitcpio.conf
+fi
+mkinitcpio -P
 
-# Enable services
+# Install systemd-boot
+bootctl --path=/boot install
+
+# Build loader entry that uses cryptdevice and points root to /dev/mapper/<crypt>
+LUKS_UUID=$(blkid -s UUID -o value "${LUKS_PART_PLACE}")
+cat > /boot/loader/loader.conf <<LOADER
+default arch
+timeout 4
+editor no
+LOADER
+
+cat > /boot/loader/entries/arch.conf <<ENTRY
+title   Arch Linux (LUKS + BTRFS)
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options cryptdevice=UUID=${LUKS_UUID}:${CRYPT_NAME_PLACE} root=/dev/mapper/${CRYPT_NAME_PLACE} rw rootflags=subvol=@
+ENTRY
+
+# Enable recommended services
 systemctl enable NetworkManager
 systemctl enable fstrim.timer
 
-echo "System configuration completed"
-EOF
-    
-    # Make script executable and run it
-    chmod +x /mnt/configure.sh
-    arch-chroot /mnt /configure.sh
-    
-    # Clean up
-    rm /mnt/configure.sh
-}
-
-setup_dracut() {
-    log "Setting up dracut for unified kernel image..."
-    
-    # Create dracut install script
-    cat > /mnt/usr/local/bin/dracut-install.sh << 'EOF'
-#!/usr/bin/env bash
-
-mkdir -p /boot/efi/EFI/Linux
-
-while read -r line; do
-    if [[ "$line" == 'usr/lib/modules/'+([^/])'/pkgbase' ]]; then
-        kver="${line#'usr/lib/modules/'}"
-        kver="${kver%'/pkgbase'}"
-
-        dracut --force --uefi --kver "$kver" /boot/efi/EFI/Linux/bootx64.efi
-    fi
-done
-EOF
-
-    # Create dracut remove script
-    cat > /mnt/usr/local/bin/dracut-remove.sh << 'EOF'
-#!/usr/bin/env bash
-rm -f /boot/efi/EFI/Linux/bootx64.efi
-EOF
-
-    # Make scripts executable
-    chmod +x /mnt/usr/local/bin/dracut-*
-    
-    # Create hooks directory
-    mkdir -p /mnt/etc/pacman.d/hooks
-    
-    # Create install hook
-    cat > /mnt/etc/pacman.d/hooks/90-dracut-install.hook << 'EOF'
+# Create pacman hook so sbctl signs kernels when linux is installed/updated
+mkdir -p /etc/pacman.d/hooks
+cat > /etc/pacman.d/hooks/sbctl-sign.hook <<HOOK
 [Trigger]
-Type = Path
 Operation = Install
 Operation = Upgrade
-Target = usr/lib/modules/*/pkgbase
+Type = Package
+Target = linux
 
 [Action]
-Description = Updating linux EFI image
+Description = Signing linux kernel and initramfs with sbctl...
 When = PostTransaction
-Exec = /usr/local/bin/dracut-install.sh
-Depends = dracut
-NeedsTargets
+Exec = /usr/bin/sbctl sign -a
+HOOK
+
+# sbctl: generate keys and enroll
+# Non-destructive (if keys exist, sbctl will not overwrite without prompt)
+sbctl create-keys
+echo "Attempting to enroll sbctl keys into firmware (may require UEFI prompt/confirmation)..."
+sbctl enroll-keys
+
+# Sign kernels and initrds now
+sbctl sign -a || true
+
+# Attempt to sign systemd-boot EFI binary so firmware accepts it
+BOOT_EFI_PATH="/boot/EFI/systemd/systemd-bootx64.efi"
+if [ -f "${BOOT_EFI_PATH}" ]; then
+  if [ -f /etc/secure-boot/keys/db.key ]; then
+    /usr/bin/sbsign --key /etc/secure-boot/keys/db.key --cert /etc/secure-boot/keys/db.crt --output "${BOOT_EFI_PATH}.signed" "${BOOT_EFI_PATH}" \
+      && mv "${BOOT_EFI_PATH}.signed" "${BOOT_EFI_PATH}" \
+      || echo "sbsign failed to sign systemd-boot. Check /etc/secure-boot/keys"
+  else
+    echo "sbctl-generated keys not found at /etc/secure-boot/keys; systemd-boot may need manual signing."
+  fi
+fi
+
+# Basic sysctl hardening (tune as desired)
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-hardening.conf <<SYSCTL
+# Networking
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+# ICMP
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# IPv6
+net.ipv6.conf.all.forwarding = 0
+SYSCTL
+
+# Rebuild initramfs to ensure changes applied
+mkinitcpio -P
+
+echo "CHROOT CONFIGURATION COMPLETE"
 EOF
 
-    # Create remove hook
-    cat > /mnt/etc/pacman.d/hooks/60-dracut-remove.hook << 'EOF'
-[Trigger]
-Type = Path
-Operation = Remove
-Target = usr/lib/modules/*/pkgbase
+# Replace placeholders before chroot
+sed \
+  -e "s|%HOSTNAME%|$HOSTNAME|g" \
+  -e "s|%USERNAME%|$USERNAME|g" \
+  -e "s|%TIMEZONE%|$TIMEZONE|g" \
+  -e "s|%LOCALE%|$LOCALE|g" \
+  -e "s|%KEYMAP%|$KEYMAP|g" \
+  -e "s|%CRYPT_NAME%|$CRYPT_NAME|g" \
+  -e "s|%LUKS_PART%|$LUKS_PART|g" \
+  /mnt/root/finish_install.sh > /mnt/root/finish_install.sh.tmp && mv /mnt/root/finish_install.sh.tmp /mnt/root/finish_install.sh
+chmod +x /mnt/root/finish_install.sh
 
-[Action]
-Description = Removing linux EFI image
-When = PreTransaction
-Exec = /usr/local/bin/dracut-remove.sh
-NeedsTargets
-EOF
+# Chroot and run final steps
+echo "Entering chroot to finalize installation..."
+arch-chroot /mnt /root/finish_install.sh
 
-    # Get LUKS UUID
-    local LUKS_UUID=$(blkid -s UUID -o value "$ROOT_PART")
-    
-    # Create dracut kernel command line
-    cat > /mnt/etc/dracut.conf.d/cmdline.conf << EOF
-kernel_cmdline="rd.luks.uuid=luks-$LUKS_UUID root=/dev/mapper/cryptroot rootfstype=btrfs rootflags=rw,noatime,compress=zstd:3,space_cache=v2,subvol=@"
-EOF
+# Set root and user passwords from outside (less risk of heredoc inside chroot)
+echo "Setting root and user passwords..."
+arch-chroot /mnt /bin/bash -c "echo root:${ROOT_PW} | chpasswd"
+arch-chroot /mnt /bin/bash -c "echo ${USERNAME}:${USER_PW} | chpasswd"
 
-    # Create dracut flags
-    cat > /mnt/etc/dracut.conf.d/flags.conf << 'EOF'
-compress="zstd"
-hostonly="no"
-EOF
+# Final cleanup
+echo "Cleaning up and unmounting..."
+umount -R /mnt || true
+cryptsetup close "$CRYPT_NAME" || true
 
-    log "Dracut configuration completed"
-}
-
-generate_uki() {
-    log "Generating unified kernel image..."
-    arch-chroot /mnt pacman -S --noconfirm linux
-    
-    if [[ ! -f /mnt/boot/efi/EFI/Linux/bootx64.efi ]]; then
-        error "Unified kernel image was not created!"
-    fi
-    
-    log "Unified kernel image created successfully"
-}
-
-setup_boot_entry() {
-    log "Creating UEFI boot entry..."
-    
-    # Create boot entry
-    arch-chroot /mnt efibootmgr --create --disk "$DISK" --part 1 --label "Arch Linux" --loader 'EFI\Linux\bootx64.efi' --unicode
-    
-    # Show boot entries
-    arch-chroot /mnt efibootmgr
-    
-    warn "Please note the Arch Linux boot entry number and set it as the first boot option in your BIOS if needed"
-}
-
-setup_secureboot() {
-    log "Setting up Secure Boot..."
-    
-    # Install sbctl
-    arch-chroot /mnt pacman -S --noconfirm sbctl
-    
-    # Create keys and sign binaries
-    arch-chroot /mnt sbctl create-keys
-    arch-chroot /mnt sbctl sign -s /boot/efi/EFI/Linux/bootx64.efi
-    
-    # Configure dracut for secure boot
-    cat > /mnt/etc/dracut.conf.d/secureboot.conf << 'EOF'
-uefi_secureboot_cert="/var/lib/sbctl/keys/db/db.pem"
-uefi_secureboot_key="/var/lib/sbctl/keys/db/db.key"
-EOF
-
-    # Create sbctl hook
-    cat > /mnt/etc/pacman.d/hooks/zz-sbctl.hook << 'EOF'
-[Trigger]
-Type = Path
-Operation = Install
-Operation = Upgrade
-Operation = Remove
-Target = boot/*
-Target = efi/*
-Target = usr/lib/modules/*/vmlinuz
-Target = usr/lib/initcpio/*
-Target = usr/lib/**/efi/*.efi*
-
-[Action]
-Description = Signing EFI binaries...
-When = PostTransaction
-Exec = /usr/bin/sbctl sign /boot/efi/EFI/Linux/bootx64.efi
-EOF
-
-    warn "IMPORTANT: Before rebooting, you need to:"
-    warn "1. Reboot and enter BIOS/UEFI settings"
-    warn "2. Enable Setup Mode for Secure Boot"
-    warn "3. Clear/erase existing Secure Boot keys"
-    warn "4. Boot back into Arch Linux"
-    warn "5. Run: sudo sbctl enroll-keys --microsoft"
-    warn "6. Reboot and enable Secure Boot in BIOS"
-}
-
-cleanup() {
-    log "Cleaning up..."
-    umount -R /mnt 2>/dev/null || true
-    cryptsetup close cryptroot 2>/dev/null || true
-}
-
-main() {
-    log "Starting automated Arch Linux installation..."
-    
-    # Pre-flight checks
-    check_uefi
-    check_internet
-    
-    # Interactive configuration
-    prompt_disk_selection
-    prompt_basic_config
-    
-    # Show final configuration
-    echo -e "${BLUE}Final Installation Configuration:${NC}"
-    echo "Disk: $DISK"
-    echo "EFI Partition: $EFI_PART"
-    echo "Root Partition: $ROOT_PART"
-    echo "Username: $USERNAME"
-    echo "Hostname: $HOSTNAME"
-    echo "Timezone: $TIMEZONE"
-    echo "Locale: $LOCALE"
-    echo "Keymap: $KEYMAP"
-    echo "CPU: $CPU_VENDOR"
-    echo
-    
-    prompt_continue "Proceed with installation?"
-    
-    # Setup pacman
-    setup_pacman_keys
-    
-    # Disk operations
-    partition_disk
-    format_efi
-    setup_encryption
-    format_btrfs
-    
-    # System installation
-    install_base_system
-    generate_fstab
-    configure_system
-    
-    # Boot setup
-    setup_dracut
-    generate_uki
-    setup_boot_entry
-    
-    # Security setup
-    setup_secureboot
-    
-    log "Installation completed successfully!"
-    warn "Remember to complete the Secure Boot setup as mentioned above."
-    warn "You can reboot now and your system should boot with the encrypted root partition."
-    
-    prompt_continue "Reboot now?"
-    reboot
-}
-
-# Trap to cleanup on exit
-trap cleanup EXIT
-
-# Run main function
-main "$@"
+echo "Installation complete."
+echo "IMPORTANT next steps:"
+echo " - Reboot into firmware and enable Secure Boot if needed."
+echo " - If UEFI prompts for key enrollment, follow the prompts."
+echo " - If system won't boot due to unsigned systemd-boot, you may need to manually sign the binary with sbsign and enroll keys."
+echo " - Kernel updates will be automatically signed by the pacman hook created (/etc/pacman.d/hooks/sbctl-sign.hook)."
+echo
+echo "Reboot now? (y/N)"
+read -r REBOOT_NOW
+if [[ "${REBOOT_NOW,,}" == "y" ]]; then
+  reboot
+fi
