@@ -3,7 +3,7 @@
 # Automated Secure Arch Linux Installation Script
 # Based on Ataraxxia's secure-arch guide with modifications:
 # - Removed LVM
-# - Added btrfs filesystem
+# - Added btrfs filesystem with subvolumes
 # - Enhanced LUKS2 encryption settings
 # - Automated installation process
 
@@ -16,20 +16,21 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Configuration variables - MODIFY THESE
-DISK="/dev/nvme0n1"  # Change this to your target disk
+# Configuration variables - MODIFY THESE (or they'll be prompted)
+DISK=""              # Will be prompted if empty
 EFI_SIZE="1024M"
-USERNAME="user"      # Change to your desired username
-HOSTNAME="archlinux" # Change to your desired hostname
-TIMEZONE="Europe/London"  # Change to your timezone
-LOCALE="en_GB.UTF-8"      # Change to your locale
-KEYMAP="us"               # Change to your keymap
+USERNAME=""          # Will be prompted if empty
+HOSTNAME="archbtw"   # Your chosen hostname
+TIMEZONE="Africa/Algiers"  # Your timezone
+LOCALE="en_US.UTF-8"       # Your locale
+KEYMAP="us"               # Your keymap
 CPU_VENDOR="intel"        # Change to "amd" if you have AMD CPU
 
-# Partition variables
-EFI_PART="${DISK}p1"
-ROOT_PART="${DISK}p2"
+# Partition variables (set dynamically after disk selection)
+EFI_PART=""
+ROOT_PART=""
 
+# Helper functions
 log() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -51,6 +52,55 @@ prompt_continue() {
         echo "Installation aborted."
         exit 1
     fi
+}
+
+prompt_disk_selection() {
+    log "Available disks:"
+    lsblk -d -o NAME,SIZE,MODEL | grep -E '^(sd|nvme|vd|hd)'
+    echo
+    
+    while true; do
+        read -p "Enter the disk to install on (e.g., /dev/sda, /dev/nvme0n1): " DISK
+        
+        if [[ ! -b "$DISK" ]]; then
+            error "Device $DISK does not exist!"
+            continue
+        fi
+        
+        echo
+        warn "WARNING: This will COMPLETELY ERASE $DISK!"
+        lsblk "$DISK"
+        echo
+        
+        read -p "Are you sure you want to use $DISK? [y/N]: " -n 1 -r
+        echo
+        
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            break
+        fi
+    done
+    
+    # Set partition variables based on disk type
+    if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmc"* ]]; then
+        EFI_PART="${DISK}p1"
+        ROOT_PART="${DISK}p2"
+    else
+        EFI_PART="${DISK}1"
+        ROOT_PART="${DISK}2"
+    fi
+    
+    log "Selected disk: $DISK"
+    log "EFI partition will be: $EFI_PART"
+    log "Root partition will be: $ROOT_PART"
+}
+
+prompt_basic_config() {
+    if [[ -z "$USERNAME" ]]; then
+        read -p "Enter username: " USERNAME
+    fi
+    
+    log "Username: $USERNAME"
+    log "Hostname: $HOSTNAME"
 }
 
 check_uefi() {
@@ -193,13 +243,18 @@ generate_fstab() {
 configure_system() {
     log "Configuring system in chroot..."
     
+    # Prompt for passwords
+    echo "Enter root password:"
+    read -s ROOT_PASSWORD
+    echo "Enter user password for $USERNAME:"
+    read -s USER_PASSWORD
+    
     # Create configuration script to run in chroot
     cat > /mnt/configure.sh << EOF
 #!/bin/bash
 set -euo pipefail
 
 # Set root password
-echo "Setting root password..."
 echo "root:$ROOT_PASSWORD" | chpasswd
 
 # Set timezone
@@ -232,19 +287,8 @@ systemctl enable fstrim.timer
 echo "System configuration completed"
 EOF
     
-    # Make script executable
+    # Make script executable and run it
     chmod +x /mnt/configure.sh
-    
-    # Prompt for passwords
-    echo "Enter root password:"
-    read -s ROOT_PASSWORD
-    echo "Enter user password for $USERNAME:"
-    read -s USER_PASSWORD
-    
-    # Export passwords for the chroot script
-    export ROOT_PASSWORD USER_PASSWORD
-    
-    # Run configuration in chroot
     arch-chroot /mnt /configure.sh
     
     # Clean up
@@ -400,16 +444,6 @@ cleanup() {
     log "Cleaning up..."
     umount -R /mnt 2>/dev/null || true
     cryptsetup close cryptroot 2>/dev/null || true
-}
-
-prompt_continue() {
-    echo -e "${BLUE}[PROMPT]${NC} $1"
-    read -p "Continue? [y/N]: " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "Installation aborted."
-        exit 1
-    fi
 }
 
 main() {
