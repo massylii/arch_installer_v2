@@ -98,6 +98,22 @@ editor no
 LOADER
 EOF
 
+# Install sbctl for Secure Boot key management
+pacman -S --noconfirm sbctl
+
+# Generate custom Secure Boot keys if not already present
+sbctl create-keys
+
+# Enroll keys into firmware (keeps Microsoft keys too for Windows boot)
+sbctl enroll-keys --microsoft
+
+# Sign the Unified Kernel Image
+sbctl sign -s /boot/efi/EFI/Linux/arch-linux.efi
+
+# Verify all signed EFI binaries
+sbctl verify
+
+
 umount -R /mnt
 cryptsetup close cryptroot
 echo "✅ Arch installation complete. Reboot and enjoy dual boot with Windows!"
