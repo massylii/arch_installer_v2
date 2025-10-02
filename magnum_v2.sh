@@ -33,12 +33,21 @@ mount /dev/mapper/cryptroot /mnt
 # 3. Btrfs subvolumes
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@var
+btrfs subvolume create /mnt/@opt
+btrfs subvolume create /mnt/@tmp
+btrfs subvolume create /mnt/@snapshots
 umount /mnt
 
+# Mount with full layout
 mount -o subvol=@,compress=zstd,noatime /dev/mapper/cryptroot /mnt
-mkdir -p /mnt/{home,boot/efi}
-mount -o subvol=@home,compress=zstd,noatime /dev/mapper/cryptroot /mnt/home
+mkdir -p /mnt/{home,var,opt,tmp,.snapshots,boot/efi}
 
+mount -o subvol=@home,compress=zstd,noatime /dev/mapper/cryptroot /mnt/home
+mount -o subvol=@var,compress=zstd,noatime /dev/mapper/cryptroot /mnt/var
+mount -o subvol=@opt,compress=zstd,noatime /dev/mapper/cryptroot /mnt/opt
+mount -o subvol=@tmp,compress=zstd,noatime /dev/mapper/cryptroot /mnt/tmp
+mount -o subvol=@snapshots,compress=zstd,noatime /dev/mapper/cryptroot /mnt/.snapshots
 # Mount Arch’s own EFI partition
 mount "$EFI_PART" /mnt/boot/efi
 
