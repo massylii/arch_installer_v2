@@ -5,32 +5,34 @@
 
 set -euo pipefail
 
-DISK="/dev/sda"            # your SSD for Arch
+DISK="/dev/sda"
 EFI_SIZE="512M"
 HOSTNAME="archlinux"
 USERNAME="archuser"
 PASSWORD="password"
+LUKS_PASSWORD="lukspassword"  # Set your LUKS passphrase
 
 # 1. Partition Arch disk
+echo "Partitioning $DISK..."
 sgdisk --zap-all "$DISK"
 parted -s "$DISK" mklabel gpt
-parted -s "$DISK" mkpart EFI fat32 1MiB $EFI_SIZE
+parted -s "$DISK" mkpart EFI fat32 1MiB "$EFI_SIZE"
 parted -s "$DISK" set 1 esp on
-parted -s "$DISK" mkpart primary $EFI_SIZE 100%
+parted -s "$DISK" mkpart primary "$EFI_SIZE" 100%
 
 EFI_PART="${DISK}1"
 ROOT_PART="${DISK}2"
 
-# 2. Format EFI + LUKS
+# 2. Format EFI + LUKS (non-interactive)
+echo "Formatting partitions..."
 mkfs.fat -F32 "$EFI_PART"
-
-cryptsetup luksFormat "$ROOT_PART"
-cryptsetup open "$ROOT_PART" cryptroot
-
+echo -n "$LUKS_PASSWORD" | cryptsetup luksFormat "$ROOT_PART" -
+echo -n "$LUKS_PASSWORD" | cryptsetup open "$ROOT_PART" cryptroot -
 mkfs.btrfs /dev/mapper/cryptroot -f
 mount /dev/mapper/cryptroot /mnt
 
 # 3. Btrfs subvolumes
+echo "Creating Btrfs subvolumes..."
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
 btrfs subvolume create /mnt/@var
@@ -40,25 +42,34 @@ btrfs subvolume create /mnt/@snapshots
 umount /mnt
 
 # Mount with full layout
+echo "Mounting subvolumes..."
 mount -o subvol=@,compress=zstd,noatime /dev/mapper/cryptroot /mnt
-mkdir -p /mnt/{home,var,opt,tmp,.snapshots,boot/efi}
-
+mkdir -p /mnt/{home,var,opt,tmp,.snapshots,boot}
 mount -o subvol=@home,compress=zstd,noatime /dev/mapper/cryptroot /mnt/home
 mount -o subvol=@var,compress=zstd,noatime /dev/mapper/cryptroot /mnt/var
 mount -o subvol=@opt,compress=zstd,noatime /dev/mapper/cryptroot /mnt/opt
 mount -o subvol=@tmp,compress=zstd,noatime /dev/mapper/cryptroot /mnt/tmp
 mount -o subvol=@snapshots,compress=zstd,noatime /dev/mapper/cryptroot /mnt/.snapshots
-# Mount Arch’s own EFI partition
-mount "$EFI_PART" /mnt/boot/efi
+
+# Mount Arch's EFI partition directly at /boot
+mount "$EFI_PART" /mnt/boot
 
 # 4. Install base system
-pacstrap -K /mnt base linux linux-firmware btrfs-progs vim sudo efibootmgr
+echo "Installing base system..."
+pacstrap -K /mnt base linux linux-firmware btrfs-progs vim sudo efibootmgr sbctl
 
 # 5. Fstab
 genfstab -U /mnt >> /mnt/etc/fstab
 
+# Get ROOT_PART UUID before chroot
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+
 # 6. Chroot config
+echo "Configuring system..."
 arch-chroot /mnt /bin/bash <<EOF
+set -euo pipefail
+
+# Timezone & locale
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 hwclock --systohc
 echo "$HOSTNAME" > /etc/hostname
@@ -70,50 +81,56 @@ echo "LANG=en_US.UTF-8" > /etc/locale.conf
 echo "root:$PASSWORD" | chpasswd
 useradd -m -G wheel -s /bin/bash "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
-echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-# Initramfs
-sed -i 's/^HOOKS=(.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
+# Initramfs with systemd-based encryption
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
 mkinitcpio -P
 
-# Kernel cmdline
-ROOT_UUID=\$(blkid -s UUID -o value $ROOT_PART)
-echo "rd.luks.name=\$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw" > /etc/kernel/cmdline
+# Bootloader: systemd-boot
+bootctl --path=/boot install
 
-# Bootloader: systemd-boot in Arch’s own EFI
-bootctl --path=/boot/efi install
-
-cat > /boot/efi/loader/entries/arch.conf <<BOOT
+# Create boot entry
+cat > /boot/loader/entries/arch.conf <<BOOT
 title   Arch Linux
 linux   /vmlinuz-linux
 initrd  /initramfs-linux.img
-options \$(cat /etc/kernel/cmdline)
+options rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw quiet splash
 BOOT
 
-cat > /boot/efi/loader/loader.conf <<LOADER
-default arch
+cat > /boot/loader/loader.conf <<LOADER
+default arch.conf
 timeout 3
 console-mode max
 editor no
 LOADER
-EOF
 
-# Install sbctl for Secure Boot key management
-pacman -S --noconfirm sbctl
-
-# Generate custom Secure Boot keys if not already present
+# Secure Boot setup
+echo "Setting up Secure Boot..."
 sbctl create-keys
-
-# Enroll keys into firmware (keeps Microsoft keys too for Windows boot)
 sbctl enroll-keys --microsoft
 
-# Sign the Unified Kernel Image
-sbctl sign -s /boot/efi/EFI/Linux/arch-linux.efi
+# Sign bootloader and kernel
+sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi
+sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI
+sbctl sign -s /boot/vmlinuz-linux
 
-# Verify all signed EFI binaries
+# Verify signatures
 sbctl verify
 
+EOF
 
+# Cleanup
+echo "Cleaning up..."
 umount -R /mnt
 cryptsetup close cryptroot
-echo "✅ Arch installation complete. Reboot and enjoy dual boot with Windows!"
+
+echo ""
+echo "✅ Arch installation complete!"
+echo ""
+echo "Next steps:"
+echo "1. Reboot and enable Secure Boot in UEFI"
+echo "2. Select 'Arch Linux' from boot menu"
+echo "3. Enter LUKS password: $LUKS_PASSWORD"
+echo ""
+echo "Windows should still boot from /dev/nvme0n1's EFI partition"
